@@ -224,16 +224,23 @@ kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess())
 | `bind()` + `listen()` success = first instance | `CreateMutexW()` success = first instance |
 | Connect to socket = second instance | `GetLastError() == ERROR_ALREADY_EXISTS` = second instance |
 
-**Rust implementation:**
+**Rust implementation (windows crate v0.58):**
 ```rust
 const MUTEX_NAME: &str = "Global\\CodexDesktopSingleInstance";
 
-fn enforce_single_instance() -> Result<bool> {
-    let wide_name: Vec<u16> = MUTEX_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+fn create_named_mutex(name: &str) -> anyhow::Result<()> {
+    let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
-        let handle = CreateMutexW(None, CREATE_MUTEX_INITIAL_OWNER, PCWSTR(wide_name.as_ptr()));
-        if handle.is_invalid() { Ok(false) } // Another instance exists
-        else { Ok(true) } // We got the mutex
+        CreateMutexW(None, true, PCWSTR(wide_name.as_ptr()))
+            .map_err(|e| anyhow::anyhow!("Failed to create mutex '{}': {}", name, e))?;
+    }
+    Ok(())
+}
+
+fn enforce_single_instance() -> Result<Option<()>> {
+    match create_named_mutex(MUTEX_NAME) {
+        Ok(()) => Ok(None),     // We got the mutex, continue
+        Err(_) => Ok(Some(())), // Another instance exists
     }
 }
 ```
@@ -375,7 +382,7 @@ codex-desktop-windows/
 │   ├── start.ps1.template         # Windows launcher template (generated at install)
 │   ├── webview-server.py          # Cross-platform HTTP server for webview assets
 │   └── src/
-│       └── main.rs                # Rust .exe launcher source (377KB compiled)
+│       └── main.rs                # Rust .exe launcher source (2.2MB compiled with LTO+strip)
 │
 ├── scripts/
 │   ├── patch-windows.js           # ASAR patch system (7 categories of patches)
@@ -442,7 +449,7 @@ cd codex-desktop-windows
 ### Option 2: Download Release
 
 1. Go to [Releases](https://github.com/roman-ryzenadvanced/codex-desktop-windows/releases)
-2. Download the latest `codex-desktop-windows-installer.exe`
+2. Download the latest `codex-desktop-launcher.exe`
 3. Run the installer and follow the wizard
 4. Launch from Start Menu or Desktop shortcut
 
@@ -469,7 +476,7 @@ rustup target add x86_64-pc-windows-msvc
 cd launcher
 cargo build --release
 
-# Output: target/release/codex-desktop.exe
+# Output: target/release/codex-desktop-launcher.exe (2.2MB with LTO+strip)
 ```
 
 #### Cross-Compile from Linux
@@ -478,18 +485,21 @@ cargo build --release
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Install zig (as cross-compilation linker)
-# Option A: cargo-zigbuild
+# Install Zig (cross-compilation toolchain)
+curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ
+export PATH="$PWD/zig-linux-x86_64-0.13.0:$PATH"
+
+# Install cargo-zigbuild
 cargo install cargo-zigbuild
 
 # Add Windows target
 rustup target add x86_64-pc-windows-gnu
 
-# Build
-cd launcher
-cargo zigbuild --release --target x86_64-pc-windows-gnu
+# Build from workspace root
+cd toolkit  # (or codex-desktop-windows/public/toolkit)
+cargo zigbuild --release --target x86_64-pc-windows-gnu -p codex-desktop-launcher
 
-# Output: target/x86_64-pc-windows-gnu/release/codex-desktop.exe
+# Output: target/x86_64-pc-windows-gnu/release/codex-desktop-launcher.exe (2.2MB)
 ```
 
 ### Build the NSIS Installer
