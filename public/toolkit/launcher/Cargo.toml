@@ -1,0 +1,26 @@
+[package]
+name = "codex-desktop-launcher"
+version = "1.0.0"
+edition = "2021"
+description = "Codex Desktop Launcher for Windows"
+authors = ["OpenAI"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = "0.4"
+reqwest = { version = "0.12", features = ["blocking"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,560 @@
+<#
+.SYNOPSIS
+    Codex Desktop Windows Launcher - Starts the webview server and Electron app
+
+.DESCRIPTION
+    This script manages the lifecycle of the Codex Desktop application on Windows:
+    - Allocates a port for the webview HTTP server
+    - Starts the Python webview server
+    - Launches Electron with the correct flags
+    - Handles multi-instance port allocation
+    - Manages plugin cache syncing
+    - Tracks PIDs for clean shutdown
+
+.PARAMETER Port
+    Override the default port for the webview server.
+
+.PARAMETER Url
+    URL to open (used by codex:// protocol handler).
+
+.PARAMETER Verbose
+    Enable verbose logging output.
+
+.PARAMETER NoDaemon
+    Run in foreground (do not detach).
+#>
+
+[CmdletBinding()]
+param(
+    [int]$Port = 0,
+    [string]$Url = "",
+    [switch]$NoDaemon,
+    [switch]$SkipPluginSync,
+    [switch]$SkipPreflight
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+# Template variables (replaced during install)
+$INSTALL_DIR = "{{INSTALL_DIR}}"
+$ELECTRON_VERSION = "{{ELECTRON_VERSION}}"
+$DEFAULT_PORT = {{DEFAULT_PORT}}
+$NODE_RUNTIME_DIR = "{{NODE_RUNTIME_DIR}}"
+
+# Resolve script directory
+$SCRIPT_DIR = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+
+# If template wasn't replaced, use script directory
+if ($INSTALL_DIR -match "^\{\{") {
+    $INSTALL_DIR = $SCRIPT_DIR
+}
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
+$ELECTRON_DIR = Join-Path $INSTALL_DIR "electron"
+$ELECTRON_EXE = Join-Path $ELECTRON_DIR "electron.exe"
+$RESOURCES_DIR = Join-Path $INSTALL_DIR "resources"
+$ASAR_PATH = Join-Path $RESOURCES_DIR "app.asar"
+$WEBVIEW_DIR = Join-Path $INSTALL_DIR "content\webview"
+$WEBVIEW_SERVER = Join-Path $INSTALL_DIR "launcher\webview-server.py"
+$PID_FILE = Join-Path $env:LOCALAPPDATA "codex-desktop\codex-desktop.pid"
+$LOG_DIR = Join-Path $env:LOCALAPPDATA "codex-desktop\logs"
+$LOG_FILE = Join-Path $LOG_DIR "start-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+$LOCK_FILE = Join-Path $env:LOCALAPPDATA "codex-desktop\codex-desktop.lock"
+
+# Port allocation
+$PORT_BASE = if ($DEFAULT_PORT -gt 0) { $DEFAULT_PORT } else { 5175 }
+$PORT_MAX = $PORT_BASE + 10
+
+if ($Port -gt 0) {
+    $PORT_BASE = $Port
+}
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] [$Level] $Message"
+
+    if ($Verbose -or $Level -in @("ERROR", "WARN", "STEP")) {
+        switch ($Level) {
+            "ERROR" { Write-Host $line -ForegroundColor Red }
+            "WARN"  { Write-Host $line -ForegroundColor Yellow }
+            "STEP"  { Write-Host $line -ForegroundColor Cyan }
+            default { Write-Host $line }
+        }
+    }
+
+    if (-not (Test-Path $LOG_DIR)) {
+        New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
+    }
+    Add-Content -Path $LOG_FILE -Value $line -ErrorAction SilentlyContinue
+}
+
+# ─── Managed Node.js Runtime ─────────────────────────────────────────────────
+
+function Initialize-NodePath {
+    if ($NODE_RUNTIME_DIR -and (Test-Path $NODE_RUNTIME_DIR) -and ($NODE_RUNTIME_DIR -notmatch "^\{\{")) {
+        $nodeExe = Join-Path $NODE_RUNTIME_DIR "node.exe"
+        if (Test-Path $nodeExe) {
+            $env:PATH = "$NODE_RUNTIME_DIR;$env:PATH"
+            Write-Log "Using managed Node.js runtime from $NODE_RUNTIME_DIR"
+            return
+        }
+    }
+
+    # Check for runtime in resources
+    $resourceRuntime = Join-Path $RESOURCES_DIR "node-runtime"
+    if (Test-Path $resourceRuntime) {
+        $nodeExe = Join-Path $resourceRuntime "node.exe"
+        if (Test-Path $nodeExe) {
+            $env:PATH = "$resourceRuntime;$env:PATH"
+            Write-Log "Using managed Node.js runtime from $resourceRuntime"
+            return
+        }
+    }
+
+    Write-Log "Using system Node.js runtime"
+}
+
+# ─── Port Allocation ──────────────────────────────────────────────────────────
+
+function Find-AvailablePort {
+    for ($p = $PORT_BASE; $p -le $PORT_MAX; $p++) {
+        $listener = $null
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $p)
+            $listener.Start()
+            $listener.Stop()
+            Write-Log "Port $p is available"
+            return $p
+        }
+        catch {
+            Write-Log "Port $p is in use, trying next" "WARN"
+        }
+        finally {
+            if ($listener) {
+                try { $listener.Stop() } catch {}
+            }
+        }
+    }
+    throw "No available port found in range $PORT_BASE-$PORT_MAX"
+}
+
+# ─── Single Instance Check ────────────────────────────────────────────────────
+
+function Test-SingleInstance {
+    if (Test-Path $PID_FILE) {
+        try {
+            $pid = Get-Content $PID_FILE -ErrorAction SilentlyContinue
+            if ($pid) {
+                $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+                if ($proc) {
+                    Write-Log "Another instance is already running (PID: $pid)" "WARN"
+
+                    # If URL provided, forward it to the running instance
+                    if ($Url) {
+                        Write-Log "Forwarding URL to running instance: $Url"
+                        # Could use named pipe or file-based IPC here
+                    }
+
+                    return $false
+                }
+            }
+        }
+        catch {
+            Write-Log "Stale PID file found, removing" "WARN"
+        }
+        Remove-Item $PID_FILE -Force -ErrorAction SilentlyContinue
+    }
+    return $true
+}
+
+# ─── Plugin Cache Sync ────────────────────────────────────────────────────────
+
+function Sync-PluginCache {
+    if ($SkipPluginSync) {
+        Write-Log "Skipping plugin sync"
+        return
+    }
+
+    Write-Log "Syncing plugin cache..."
+
+    $pluginCacheDir = Join-Path $env:APPDATA ".codex\plugins\cache"
+    $appPluginDir = Join-Path $RESOURCES_DIR "plugins"
+
+    if (-not (Test-Path $pluginCacheDir)) {
+        New-Item -ItemType Directory -Path $pluginCacheDir -Force | Out-Null
+    }
+
+    # Sync Browser Use plugin
+    $browserUseSource = Join-Path $appPluginDir "browser-use"
+    if (Test-Path $browserUseSource) {
+        $dest = Join-Path $pluginCacheDir "browser-use"
+        if (-not (Test-Path $dest)) {
+            Copy-Item $browserUseSource $dest -Recurse -Force
+            Write-Log "Synced Browser Use plugin"
+        }
+    }
+
+    # Sync Chrome plugin + native messaging host
+    $chromeSource = Join-Path $appPluginDir "chrome"
+    if (Test-Path $chromeSource) {
+        $dest = Join-Path $pluginCacheDir "chrome"
+        if (-not (Test-Path $dest)) {
+            Copy-Item $chromeSource $dest -Recurse -Force
+            Write-Log "Synced Chrome plugin"
+        }
+
+        # Register native messaging host
+        $nmhDir = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data\NativeMessagingHosts"
+        if (-not (Test-Path $nmhDir)) {
+            New-Item -ItemType Directory -Path $nmhDir -Force | Out-Null
+        }
+        $nmhManifest = Join-Path $chromeSource "com.codex.chrome.json"
+        if (Test-Path $nmhManifest) {
+            Copy-Item $nmhManifest $nmhDir -Force
+            Write-Log "Registered Chrome native messaging host"
+        }
+    }
+
+    # Sync Computer Use plugin
+    $computerUseSource = Join-Path $appPluginDir "computer-use"
+    if (Test-Path $computerUseSource) {
+        $dest = Join-Path $pluginCacheDir "computer-use"
+        if (-not (Test-Path $dest)) {
+            Copy-Item $computerUseSource $dest -Recurse -Force
+            Write-Log "Synced Computer Use plugin (Windows backend)"
+        }
+    }
+
+    # Sync Read Aloud plugin
+    $readAloudSource = Join-Path $appPluginDir "read-aloud"
+    if (Test-Path $readAloudSource) {
+        $dest = Join-Path $pluginCacheDir "read-aloud"
+        if (-not (Test-Path $dest)) {
+            Copy-Item $readAloudSource $dest -Recurse -Force
+            Write-Log "Synced Read Aloud plugin"
+        }
+    }
+
+    Write-Log "Plugin cache sync complete"
+}
+
+# ─── URL Scheme Registration ──────────────────────────────────────────────────
+
+function Register-UrlScheme {
+    $regPath = "HKCU:\SOFTWARE\Classes\codex"
+    try {
+        if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+        }
+        Set-ItemProperty -Path $regPath -Name "(Default)" -Value "URL:Codex Desktop Protocol"
+        Set-ItemProperty -Path $regPath -Name "URL Protocol" -Value ""
+
+        $shellPath = "$regPath\shell\open\command"
+        if (-not (Test-Path $shellPath)) {
+            New-Item -Path $shellPath -Force | Out-Null
+        }
+
+        $scriptPath = Join-Path $INSTALL_DIR "start.ps1"
+        $command = "`"$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Url `"%1`""
+        Set-ItemProperty -Path $shellPath -Name "(Default)" -Value $command
+
+        Write-Log "URL scheme codex:// registered (HKCU)"
+    }
+    catch {
+        Write-Log "Failed to register URL scheme: $_" "WARN"
+    }
+}
+
+# ─── Cold Start Hooks ─────────────────────────────────────────────────────────
+
+function Invoke-ColdStartHooks {
+    $hookDir = Join-Path $INSTALL_DIR "hooks\cold-start"
+    if (-not (Test-Path $hookDir)) {
+        Write-Log "No cold start hooks directory"
+        return
+    }
+
+    $hooks = Get-ChildItem -Path $hookDir -Filter "*.ps1" -File | Sort-Object Name
+    foreach ($hook in $hooks) {
+        Write-Log "Running cold start hook: $($hook.Name)"
+        try {
+            & $hook.FullName
+            Write-Log "Hook $($hook.Name) completed successfully"
+        }
+        catch {
+            Write-Log "Hook $($hook.Name) failed: $_" "WARN"
+        }
+    }
+}
+
+# ─── CLI Preflight Check ──────────────────────────────────────────────────────
+
+function Invoke-CliPreflight {
+    if ($SkipPreflight) {
+        Write-Log "Skipping CLI preflight check"
+        return
+    }
+
+    Write-Log "Running CLI preflight check..."
+
+    # Check Python
+    $pythonCmd = $null
+    if (Get-Command "python3" -ErrorAction SilentlyContinue) {
+        $pythonCmd = "python3"
+    }
+    elseif (Get-Command "python" -ErrorAction SilentlyContinue) {
+        $pythonCmd = "python"
+    }
+
+    if (-not $pythonCmd) {
+        Write-Log "Python not found - webview server may not work" "WARN"
+    }
+
+    # Check Electron binary
+    if (-not (Test-Path $ELECTRON_EXE)) {
+        throw "Electron binary not found at $ELECTRON_EXE"
+    }
+
+    # Check app.asar
+    if (-not (Test-Path $ASAR_PATH)) {
+        throw "app.asar not found at $ASAR_PATH"
+    }
+
+    # Check webview content
+    if (-not (Test-Path $WEBVIEW_DIR)) {
+        Write-Log "Webview directory not found at $WEBVIEW_DIR" "WARN"
+    }
+
+    Write-Log "CLI preflight check passed"
+}
+
+# ─── Webview Server ───────────────────────────────────────────────────────────
+
+function Start-WebviewServer {
+    param([int]$Port)
+
+    Write-Log "Starting webview HTTP server on port $Port..."
+
+    $pythonCmd = $null
+    if (Get-Command "python3" -ErrorAction SilentlyContinue) {
+        $pythonCmd = "python3"
+    }
+    elseif (Get-Command "python" -ErrorAction SilentlyContinue) {
+        $pythonCmd = "python"
+    }
+
+    if (-not $pythonCmd) {
+        Write-Log "Python not available, webview server cannot start" "ERROR"
+        throw "Python is required for the webview server"
+    }
+
+    if (-not (Test-Path $WEBVIEW_SERVER)) {
+        Write-Log "Webview server script not found: $WEBVIEW_SERVER" "ERROR"
+        throw "webview-server.py not found"
+    }
+
+    $serverLog = Join-Path $LOG_DIR "webview-server.log"
+
+    # Start server as background process
+    $serverProcess = Start-Process -FilePath $pythonCmd `
+        -ArgumentList "`"$WEBVIEW_SERVER`" --port $Port --directory `"$WEBVIEW_DIR`"" `
+        -NoNewWindow `
+        -PassThru `
+        -RedirectStandardOutput (Join-Path $LOG_DIR "webview-server-stdout.log") `
+        -RedirectStandardError (Join-Path $LOG_DIR "webview-server-stderr.log")
+
+    Write-Log "Webview server started (PID: $($serverProcess.Id))"
+
+    # Wait for server to be ready
+    $maxRetries = 30
+    $retryInterval = 500  # ms
+
+    for ($i = 0; $i -lt $maxRetries; $i++) {
+        Start-Sleep -Milliseconds $retryInterval
+        try {
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+            Write-Log "Webview server is ready (HTTP $($response.StatusCode))"
+            return $serverProcess
+        }
+        catch {
+            # Server not ready yet
+            if ($serverProcess.HasExited) {
+                throw "Webview server exited unexpectedly with code $($serverProcess.ExitCode)"
+            }
+        }
+    }
+
+    throw "Webview server failed to start within $($maxRetries * $retryInterval / 1000) seconds"
+}
+
+# ─── Electron Launch ──────────────────────────────────────────────────────────
+
+function Start-CodexElectron {
+    param(
+        [int]$Port,
+        [System.Diagnostics.Process]$ServerProcess
+    )
+
+    $loadUrl = "http://127.0.0.1:$Port"
+
+    Write-Log "Launching Electron..."
+    Write-Log "  Binary: $ELECTRON_EXE"
+    Write-Log "  ASAR: $ASAR_PATH"
+    Write-Log "  URL: $loadUrl"
+
+    # Build Electron arguments
+    $electronArgs = @(
+        "--no-sandbox"
+        "--disable-gpu-sandbox"
+        "--app-user-model-id=CodexDesktop"
+        "--load-url=$loadUrl"
+        "--app-path=$ASAR_PATH"
+    )
+
+    # Add URL if provided via protocol handler
+    if ($Url) {
+        $electronArgs += "--open-url=$Url"
+    }
+
+    # Start Electron
+    $electronProcess = Start-Process -FilePath $ELECTRON_EXE `
+        -ArgumentList $electronArgs `
+        -PassThru
+
+    Write-Log "Electron started (PID: $($electronProcess.Id))"
+
+    # Write PID file
+    $PID_FILE_DIR = Split-Path -Parent $PID_FILE
+    if (-not (Test-Path $PID_FILE_DIR)) {
+        New-Item -ItemType Directory -Path $PID_FILE_DIR -Force | Out-Null
+    }
+    Set-Content -Path $PID_FILE -Value $electronProcess.Id -Force
+
+    return $electronProcess
+}
+
+# ─── Process Lifecycle Management ─────────────────────────────────────────────
+
+function Watch-ProcessLifecycle {
+    param(
+        [System.Diagnostics.Process]$ElectronProcess,
+        [System.Diagnostics.Process]$ServerProcess,
+        [int]$Port
+    )
+
+    Write-Log "Monitoring process lifecycle..."
+
+    try {
+        # Wait for Electron to exit
+        $ElectronProcess.WaitForExit()
+        Write-Log "Electron process exited (code: $($ElectronProcess.ExitCode))"
+    }
+    finally {
+        # Cleanup: stop server process
+        if ($ServerProcess -and -not $ServerProcess.HasExited) {
+            Write-Log "Stopping webview server (PID: $($ServerProcess.Id))"
+            try {
+                Stop-Process -Id $ServerProcess.Id -Force -ErrorAction SilentlyContinue
+                Write-Log "Webview server stopped"
+            }
+            catch {
+                Write-Log "Failed to stop webview server: $_" "WARN"
+            }
+        }
+
+        # Kill any orphaned Python processes on our port
+        try {
+            $connections = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue |
+                Where-Object { $_.State -eq "Listen" }
+            foreach ($conn in $connections) {
+                Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            Write-Log "Could not clean up orphaned processes on port $Port" "WARN"
+        }
+
+        # Remove PID file
+        if (Test-Path $PID_FILE) {
+            Remove-Item $PID_FILE -Force -ErrorAction SilentlyContinue
+        }
+
+        # Remove lock file
+        if (Test-Path $LOCK_FILE) {
+            Remove-Item $LOCK_FILE -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Log "Cleanup complete"
+    }
+}
+
+# ─── Main Entry Point ─────────────────────────────────────────────────────────
+
+function Main {
+    Write-Host ""
+    Write-Host "  ╔═══════════════════════════════════════════╗" -ForegroundColor Magenta
+    Write-Host "  ║       Codex Desktop - Windows Launcher    ║" -ForegroundColor Magenta
+    Write-Host "  ╚═══════════════════════════════════════════╝" -ForegroundColor Magenta
+    Write-Host ""
+
+    try {
+        # Step 1: Setup managed Node.js
+        Initialize-NodePath
+
+        # Step 2: Single instance check
+        if (-not (Test-SingleInstance)) {
+            Write-Host "Codex Desktop is already running." -ForegroundColor Yellow
+            return
+        }
+
+        # Step 3: CLI preflight
+        Invoke-CliPreflight
+
+        # Step 4: Plugin cache sync
+        Sync-PluginCache
+
+        # Step 5: URL scheme registration (per-user)
+        Register-UrlScheme
+
+        # Step 6: Cold start hooks
+        Invoke-ColdStartHooks
+
+        # Step 7: Allocate port
+        $port = Find-AvailablePort
+        Write-Log "Using port: $port"
+
+        # Step 8: Start webview server
+        $serverProcess = Start-WebviewServer -Port $port
+
+        # Step 9: Launch Electron
+        $electronProcess = Start-CodexElectron -Port $port -ServerProcess $serverProcess
+
+        # Step 10: Monitor lifecycle
+        if ($NoDaemon) {
+            Watch-ProcessLifecycle -ElectronProcess $electronProcess `
+                -ServerProcess $serverProcess -Port $port
+        }
+        else {
+            # Detached mode: just monitor in background
+            Write-Log "Codex Desktop launched in background"
+            Write-Host "  Codex Desktop is running (PID: $($electronProcess.Id))" -ForegroundColor Green
+            Write-Host "  Webview server on port $port" -ForegroundColor Green
+            Write-Host "  Log: $LOG_FILE" -ForegroundColor Gray
+        }
+    }
+    catch {
+        Write-Host "  Error: $_" -ForegroundColor Red
+        Write-Log "LAUNCH FAILED: $_" "ERROR"
+        exit 1
+    }
+}
+
+# Run main
+Main

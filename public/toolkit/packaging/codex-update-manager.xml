@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  ═══════════════════════════════════════════════════════════════════════════════
+  Codex Desktop - Windows Task Scheduler Configuration for Auto-Update Checks
+  ═══════════════════════════════════════════════════════════════════════════════
+
+  This XML defines a scheduled task that checks for Codex Desktop updates
+  every 6 hours. The task runs as the current user and starts on logon.
+
+  Import via:
+    schtasks /Create /TN "CodexDesktopUpdateManager" /XML codex-update-manager.xml
+
+  Or via PowerShell:
+    Register-ScheduledTask -Xml (Get-Content codex-update-manager.xml | Out-String) -TaskName "CodexDesktopUpdateManager"
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Codex Desktop Auto-Update Manager - Checks for updates every 6 hours</Description>
+    <Author>OpenAI</Author>
+    <Version>1.0.0</Version>
+    <URI>\CodexDesktopUpdateManager</URI>
+  </RegistrationInfo>
+
+  <Triggers>
+    <!-- Trigger 1: Run every 6 hours, starting at logon -->
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT5M</Delay>
+      <!-- Wait 5 minutes after logon before first check -->
+    </LogonTrigger>
+
+    <!-- Trigger 2: Repeat every 6 hours throughout the day -->
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT6H</Interval>
+        <!-- 6 hours between checks -->
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2024-01-01T08:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+
+    <!-- Trigger 3: Run once daily at 9 AM as a backup -->
+    <CalendarTrigger>
+      <StartBoundary>2024-01-01T09:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+      <!-- Run as current user without elevation -->
+    </Principal>
+  </Principals>
+
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <!-- Don't start a new instance if one is already running -->
+
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <!-- Allow updates on battery power -->
+
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <!-- Don't stop if switching to battery -->
+
+    <AllowHardTerminate>true</AllowHardTerminate>
+
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <!-- Start the task even if the scheduled time has passed -->
+
+    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>
+    <!-- Only run when network is available -->
+
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <!-- Allow manual trigger -->
+
+    <Enabled>true</Enabled>
+
+    <Hidden>false</Hidden>
+
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <!-- Don't wait for idle state -->
+
+    <WakeToRun>false</WakeToRun>
+    <!-- Don't wake the computer -->
+
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <!-- Kill the task if it runs for more than 1 hour -->
+
+    <Priority>7</Priority>
+    <!-- Below normal priority - don't interfere with user work -->
+
+    <RestartOnFailure>
+      <Interval>PT15M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+    <!-- Retry up to 3 times with 15 minute intervals -->
+  </Settings>
+
+  <Actions Context="Author">
+    <Exec>
+      <Command>%ProgramFiles%\Codex Desktop\updater\codex-update-manager.exe</Command>
+      <Arguments>check --quiet</Arguments>
+      <WorkingDirectory>%ProgramFiles%\Codex Desktop\updater</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
